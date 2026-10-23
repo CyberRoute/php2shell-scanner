@@ -1,74 +1,98 @@
 # php2shell-scanner
 
-Non-destructive validator for **CVE-2026-109618 / CVE-2026-109619** — the PHP
-`session.upload_progress` filename-injection chain.
+Non-destructive **exposure detector** for **CVE-2026-109618 / CVE-2026-109619** —
+the two PHP "php2shell" vulnerabilities fixed in the PHP October 2026 security
+release (2026-10-21).
 
-The POCs demonstrate full RCE; this scanner only **detects and confirms the vulnerability primitive**, so it is safe to point at an in-scope target to answer "is this host exploitable?".
+| CVE | Name |
+|-----|------|
+| CVE-2026-109618 | RCE via **OOM corruption** (GHSA-w8hw-w9fx-j79w) |
+| CVE-2026-109619 | RCE via **stale global state** (GHSA-6wmf-4rv5-p3rp) |
+
+Both are unauthenticated-RCE **memory-corruption / use-after-free** bugs,
+exploitable under default configuration, with an affected code path reaching
+back to PHP 5.4.0. See the write-up: <https://calif.io/php2shell/>.
+
+## How the real bug works (and why confirmation is destructive)
+
+The exploit has two stages:
+
+1. **Force a controllable fatal.** A crafted multipart body (e.g. HTTP/1.1
+   chunked or HTTP/2 lengthless requests that slip past `post_max_size`, plus
+   hundreds of empty-filename upload parts with deeply nested field names that
+   each expand into many `$_FILES` HashTables) exhausts `memory_limit` and
+   triggers a fatal **inside native code, before cleanup runs.**
+2. **Reclaim the stale state.** The interrupted path leaves a dangling pointer
+   or stale global (a partially-initialised hash bucket, the session
+   upload-progress state, or the `unserialize` decoder state). A follow-up
+   request reclaims that freed heap into an RCE primitive.
+
+Stage 1 is, by construction, an **out-of-memory denial-of-service**, and stage 2
+reclaims corrupted heap. There is **no safe, non-destructive way to actively
+confirm** these bugs on a live target. **This tool deliberately does not attempt
+to trigger, exhaust memory, or exploit anything.** It reasons about *exposure*
+from passive signals and benign preconditions only.
 
 ## What it does
 
-| # | Check            | Signal |
-|---|------------------|--------|
-| 1 | Fingerprint      | PHP version from `Server` / `X-Powered-By`, mapped to the fixed-release table |
-| 2 | Fixation         | Is a POST-body `PHPSESSID` honored? (`session.use_only_cookies = Off`) |
-| 3 | upload_progress  | Is the `PHP_SESSION_UPLOAD_PROGRESS` multipart mechanism accepted (not disabled / WAF-blocked)? |
-| 4 | Confirm (opt-in) | Inject an **inert random canary** via the upload filename, then read it back through a supplied LFI and match it |
+| # | Check | Signal |
+|---|-------|--------|
+| 1 | Fingerprint   | PHP version from `Server` / `X-Powered-By` (or body), mapped to the Oct-2026 fixed-release table — the reliable signal |
+| 2 | SAPI          | mod_php (Apache) vs PHP-FPM (nginx) vs unknown — context only; both CVEs apply to both |
+| 3 | Preconditions | Is PHP session handling reachable (`Set-Cookie: PHPSESSID`) and is a single benign multipart POST accepted? Necessary — not sufficient — for the stale-global-state path |
 
-It **never executes code on the target.** Check 4 writes a harmless token like `P2S_da68fe7c...` (no `<?php` tags), reads it back, and matches the string. Matching proves the inject-and-include primitive — the exact point the `poc/`
-repo swaps the token for a PHP payload to get RCE.
+The check-3 probe is **one small, well-formed request**. It does not bypass
+`post_max_size`, does not inflate memory, and does not try to force a fatal.
 
 ## Usage
 
 ```bash
-# Preconditions only (version + fixation + upload_progress)
+python3 scan.py --target http://host:port --yes
 python3 scan.py --target http://host:port --session-path /index.php --yes
-
-# Full end-to-end confirmation with an LFI endpoint
-python3 scan.py \
-  --target http://host:port \
-  --session-path /index.php \
-  --lfi 'http://host:port/vuln.php?page=FUZZ' \
-  --save-path /tmp/sessions \
-  --yes
 ```
 
-- `--session-path` — any endpoint that calls `session_start()` (the session file
-  is written during this request). Defaults to `/`.
-- `--lfi` — a file-read/LFI endpoint with `FUZZ` where the file path goes.
-  Without it, check 4 is skipped and the best verdict is *LIKELY VULNERABLE*.
-- `--save-path` — the target's `session.save_path`. If omitted, a short
-  candidate list (`/tmp/sessions`, `/var/lib/php/sessions`, …) is tried.
+- `--session-path` — any endpoint that calls `session_start()` (default `/`).
 - `--yes` — required acknowledgement that you are authorized to test the target.
+- `--timeout` — per-request timeout in seconds (default 10).
 
-Stdlib-only; no dependencies. Plain HTTP only (no TLS wrapper yet).
+Stdlib-only; no dependencies. The raw-socket precondition probe is plain-HTTP
+only (no TLS wrapper yet); against `https://` targets, only checks 1 and 2 run.
 
 ## Verdicts
 
 | Verdict | Meaning |
 |---------|---------|
-| `VULNERABLE (confirmed)` | canary injected and read back — primitive proven |
-| `LIKELY VULNERABLE` | affected version + fixation + upload_progress, no LFI supplied to confirm |
-| `PRECONDITIONS PRESENT` | some signals hold; version unclear or one check failed |
+| `LIKELY VULNERABLE` | PHP version is below the Oct-2026 fixed release for its branch |
 | `LIKELY PATCHED` | PHP version is at/above the fixed release for its branch |
-| `NOT DETECTED` | no preconditions observed |
+| `UNDETERMINED` | PHP version could not be established remotely — judge from the build and patch regardless |
 
-Exit code `0` when confirmed or version is in the affected range, else `1`
+Exit code `0` when the version is in the affected range, else `1`
 (`2` = unreachable / refused).
 
-## Fixed releases
+## Fixed releases (PHP October 2026 security release, 2026-10-21)
 
-`8.2.35`, `8.3.36`, `8.4.27`, `8.5.12`. Branches 8.1/8.0/7.x/5.x are EOL and
-treated as vulnerable where `upload_progress` exists.
+`8.2.35`, `8.3.36`, `8.4.27`, `8.5.12`. PHP **8.1 and older receive no official
+fixed release** (only minimal source backports) and are treated as vulnerable
+wherever PHP is in use.
 
 ## Mitigation
 
+Patching is the only real fix. The upstream temporary mitigations are partial
+and come with a warning that they do **not** replace a patch:
+
 ```ini
-session.upload_progress.enabled = Off
-session.use_only_cookies = On
+; PHP-FPM
+session.upload_progress.enabled = 0
+memory_limit = -1
+
+; mod_php
+memory_limit = -1
 ```
-…and patch PHP to the fixed release for your branch.
+
+`memory_limit = -1` removes PHP's memory cap and *increases* exhaustion risk, so
+upgrade to a fixed release instead of relying on it.
 
 ## Disclaimer
 
 For authorized security testing and educational use only. Do not scan systems
-you do not own or lack explicit written permission to test. Tested on https://github.com/ikow/php2shell-poc
+you do not own or lack explicit written permission to test.

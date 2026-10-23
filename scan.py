@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
 """
-php2shell-scanner — CVE-2026-109618 / CVE-2026-109619 vulnerability validator.
+php2shell-scanner — CVE-2026-109618 / CVE-2026-109619 exposure detector.
 
-Non-destructive detector for the PHP session.upload_progress injection chain.
+Non-destructive detector for the two PHP "php2shell" vulnerabilities fixed in
+the PHP October 2026 security release (2026-10-21):
 
-It never executes code on the target. Confirmation is done with an INERT random
-canary: a unique token is written into a session file through the upload_progress
-filename, then — only if you supply an LFI/file-read endpoint — read back over
-HTTP and matched. Matching the canary proves the inject+include primitive (the
-same primitive the repo's poc/ turns into RCE) without running anything.
+  * CVE-2026-109618 — RCE via OOM corruption   (GHSA-w8hw-w9fx-j79w)
+  * CVE-2026-109619 — RCE via stale global state (GHSA-6wmf-4rv5-p3rp)
 
-Checks performed:
-  1. Fingerprint  — PHP version from Server / X-Powered-By, mapped to the
-                    affected/fixed table.
-  2. Fixation     — is a POST-body PHPSESSID honored (session.use_only_cookies
-                    = Off), letting an attacker choose the session id?
-  3. upload_prog  — is the upload_progress multipart mechanism accepted (not
-                    WAF-blocked / disabled)?
-  4. Confirm      — (optional, needs --lfi) inject an inert canary and read it
-                    back through the LFI to prove injection+inclusion.
+Both are memory-corruption / use-after-free bugs. The real exploit forces a
+*controllable fatal* (memory_limit exhaustion via crafted multipart bodies)
+that interrupts native code before cleanup, leaving dangling pointers / stale
+global state that a second request reclaims into an RCE primitive. See
+https://calif.io/php2shell/ for the full write-up.
+
+WHAT THIS TOOL DOES AND DOES NOT DO
+-----------------------------------
+There is no safe, non-destructive way to *actively confirm* these bugs: the
+trigger stage is an intentional out-of-memory fatal, i.e. a denial-of-service,
+and the follow-up reclaims corrupted heap. This scanner therefore DELIBERATELY
+does not attempt to trigger, exhaust memory, or exploit anything. It only reads
+passive signals and benign preconditions and reasons about exposure:
+
+  1. Fingerprint  — PHP version from Server / X-Powered-By (or body), mapped to
+                    the October-2026 fixed-release table.
+  2. SAPI         — mod_php (Apache) vs PHP-FPM (nginx/fastcgi) vs unknown. Both
+                    CVEs apply; the SAPI only changes which internal path is hit.
+  3. Preconditions— is PHP session handling reachable (Set-Cookie PHPSESSID)
+                    and is a multipart POST accepted? These are necessary (not
+                    sufficient) for the stale-global-state path.
+
+The verdict is driven mainly by the PHP version, because that is the only
+reliable, non-destructive signal for a memory-corruption bug.
 
 Usage:
-  python3 scan.py --target http://host:port
-  python3 scan.py --target http://host:port \
-      --session-path /index.php \
-      --lfi 'http://host:port/vuln.php?page=FUZZ' \
-      --save-path /tmp/sessions
+  python3 scan.py --target http://host:port --yes
+  python3 scan.py --target http://host:port --session-path /index.php --yes
 
-AUTHORIZED TESTING ONLY. Run against systems you own or are explicitly
+AUTHORIZED TESTING ONLY. Run only against systems you own or are explicitly
 permitted to test. See README.md.
 """
 import argparse
@@ -35,19 +45,22 @@ import re
 import secrets
 import socket
 import sys
+import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-# ---- Affected-version table (from the advisory) ----------------------------
-# Each stable branch is fixed at the version below; anything earlier in that
-# branch is vulnerable. Branches not listed (8.1, 8.0, 7.x, 5.x) are EOL and
-# treated as vulnerable when upload_progress exists.
+# ---- Fixed-release table (PHP October 2026 security release) ----------------
+# Each active branch is fixed at the version below; anything earlier in that
+# branch is vulnerable. 8.1 and older received no official release — only
+# minimal source backports exist — so they are treated as vulnerable.
 BRANCH_FIX = {
     (8, 2): 35,
     (8, 3): 36,
     (8, 4): 27,
     (8, 5): 12,
 }
+# Branches with no fixed release. The page states the earliest affected path
+# dates back to PHP 5.4.0, so every EOL branch at/after 5.4 is exposed.
 EOL_VULNERABLE = {(8, 1), (8, 0), (7, 4), (7, 3), (7, 2), (7, 1), (7, 0),
                   (5, 6), (5, 5), (5, 4)}
 
@@ -67,10 +80,11 @@ def classify_version(ver):
     if branch in BRANCH_FIX:
         fix = BRANCH_FIX[branch]
         if patch < fix:
-            return "vulnerable", f"{ver} < {major}.{minor}.{fix} (patched)"
+            return "vulnerable", f"{ver} < {major}.{minor}.{fix} (Oct-2026 fix)"
         return "patched", f"{ver} >= {major}.{minor}.{fix}"
     if branch in EOL_VULNERABLE:
-        return "vulnerable", f"{major}.{minor}.x is end-of-life, no official fix"
+        return "vulnerable", (f"{major}.{minor}.x is end-of-life; no official "
+                              f"fixed release (only source backports)")
     if major > 8 or (major == 8 and minor > 5):
         return "unknown", f"{ver} is newer than the advisory range"
     return "unknown", f"{ver} not in the advisory table"
@@ -90,20 +104,42 @@ def fingerprint(target, timeout):
         return None, {"_error": str(e)}, b""
 
 
-def upload_progress_post(host, port, path, sid, filename, send_cookie, timeout):
-    """Send one upload_progress multipart POST over a raw socket.
+def detect_sapi(headers, body):
+    """Best-effort mod_php vs PHP-FPM guess from passive response signals.
 
-    PHPSESSID is placed in the POST body (fixation probe); the cookie is sent
-    only when send_cookie is True. Returns (status_line, body_bytes, set_cookie).
+    Returns (sapi, note). The two CVEs apply to both SAPIs; this only indicates
+    which internal code path (request-shutdown vs worker-exit / Basic RINIT) the
+    write-up describes for this deployment.
+    """
+    server = (headers.get("server", "") or "").lower()
+    powered = (headers.get("x-powered-by", "") or "").lower()
+    if "mod_php" in server or re.search(r"php/[\d.]+", server):
+        return "mod_php", f"Apache mod_php signature in Server: {headers.get('server')}"
+    if "apache" in server and powered.startswith("php"):
+        # Apache can also proxy to FPM; mod_php exposes PHP in Server more often.
+        return "apache", f"Apache + X-Powered-By PHP (mod_php or proxied FPM): {headers.get('server')}"
+    if "nginx" in server:
+        return "fpm?", f"nginx front-end (PHP typically served via PHP-FPM): {headers.get('server')}"
+    if powered.startswith("php"):
+        return "unknown", f"PHP present (X-Powered-By) but SAPI not distinguishable"
+    return "unknown", "no SAPI-identifying headers"
+
+
+def multipart_probe(host, port, path, sid, timeout):
+    """Send ONE benign upload_progress multipart POST over a raw socket.
+
+    This is a single small, well-formed request. It does NOT bypass
+    post_max_size, does NOT inflate memory, and does NOT attempt to force a
+    fatal — it only checks that the server accepts a multipart POST carrying a
+    PHP_SESSION_UPLOAD_PROGRESS field (a precondition of the stale-global-state
+    path). Returns (status_line, set_cookie).
     """
     boundary = "SCAN" + secrets.token_hex(4)
     body = (
         f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="PHPSESSID"\r\n\r\n{sid}\r\n'
+        f'Content-Disposition: form-data; name="PHP_SESSION_UPLOAD_PROGRESS"\r\n\r\nscan\r\n'
         f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="PHP_SESSION_UPLOAD_PROGRESS"\r\n\r\nx\r\n'
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="f"; filename="{filename}"\r\n\r\nZ\r\n'
+        f'Content-Disposition: form-data; name="f"; filename="probe.txt"\r\n\r\nZ\r\n'
         f"--{boundary}--\r\n"
     ).encode("latin-1")
 
@@ -111,12 +147,11 @@ def upload_progress_post(host, port, path, sid, filename, send_cookie, timeout):
         f"POST {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
         f"User-Agent: php2shell-scanner\r\n"
+        f"Cookie: PHPSESSID={sid}\r\n"
         f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
         f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n"
     )
-    if send_cookie:
-        headers += f"Cookie: PHPSESSID={sid}\r\n"
-    headers += "Connection: close\r\n\r\n"
 
     s = socket.create_connection((host, port), timeout=timeout)
     s.sendall(headers.encode() + body)
@@ -134,23 +169,9 @@ def upload_progress_post(host, port, path, sid, filename, send_cookie, timeout):
 
     status = resp.split(b"\r\n", 1)[0].decode("latin1", "replace") if resp else "NO RESPONSE"
     head = resp.split(b"\r\n\r\n", 1)[0] if b"\r\n\r\n" in resp else resp
-    body_out = resp.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in resp else b""
     m = re.search(rb"set-cookie:\s*(.*)", head, re.I)
     set_cookie = m.group(1).decode("latin1", "replace").strip() if m else ""
-    return status, body_out, set_cookie
-
-
-def lfi_read(lfi_template, file_path, timeout):
-    """GET the LFI endpoint with FUZZ replaced by file_path; return body bytes."""
-    url = lfi_template.replace("FUZZ", urllib.parse.quote(file_path, safe="/"))
-    req = urllib.request.Request(url, headers={"User-Agent": "php2shell-scanner"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read(262144)
-    except urllib.error.HTTPError as e:
-        return e.read(262144)
-    except Exception:
-        return b""
+    return status, set_cookie
 
 
 # ---- Main -------------------------------------------------------------------
@@ -161,12 +182,6 @@ def main():
     ap.add_argument("--session-path", default="/",
                     help="path to an endpoint that calls session_start() "
                          "(default '/')")
-    ap.add_argument("--lfi", default=None,
-                    help="LFI/file-read endpoint with FUZZ marker, e.g. "
-                         "'http://h/vuln.php?page=FUZZ' — enables canary confirmation")
-    ap.add_argument("--save-path", default=None,
-                    help="session.save_path on the target; if omitted, a short "
-                         "candidate list is tried for the canary read-back")
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--yes", action="store_true",
                     help="confirm you are authorized to test this target")
@@ -181,22 +196,25 @@ def main():
     u = urlparse(args.target)
     host, port = u.hostname, (u.port or (443 if u.scheme == "https" else 80))
     if u.scheme == "https":
-        print(c("[!] Raw-socket probes target plain HTTP; https targets need a "
-                "TLS wrapper (not implemented here).", "yellow"))
+        print(c("[!] Raw-socket probe targets plain HTTP; https targets need a "
+                "TLS wrapper (not implemented here) — only checks 1/2 will run.",
+                "yellow"))
 
-    print(c("php2shell-scanner — CVE-2026-109618/109619", "blue"))
+    print(c("php2shell-scanner — CVE-2026-109618 (OOM corruption) / "
+            "CVE-2026-109619 (stale global state)", "blue"))
     print(f"[*] Target: {args.target}\n")
 
     results = {}
 
-    # --- Check 1: fingerprint -----------------------------------------------
+    # --- Check 1: version fingerprint ---------------------------------------
     status, headers, body = fingerprint(args.target, args.timeout)
     if status is None:
         print(c(f"[1] Fingerprint       FAIL — unreachable ({headers.get('_error')})",
                 "red"))
         sys.exit(2)
     banner = headers.get("x-powered-by", "") or headers.get("server", "")
-    vm = re.search(r"PHP/([\d.]+)", banner) or re.search(r"PHP ([\d.]+)", body.decode("latin1", "replace"))
+    vm = re.search(r"PHP/([\d.]+)", banner) or \
+        re.search(r"PHP ([\d.]+)", body.decode("latin1", "replace"))
     version = vm.group(1) if vm else None
     verdict, note = classify_version(version)
     results["version"] = verdict
@@ -204,98 +222,73 @@ def main():
              "unknown": c("unknown", "yellow")}[verdict]
     print(f"[1] Fingerprint       PHP {version or '?'}  -> {label}")
     print(c(f"       {note}  (banner: {banner or 'none'})", "grey"))
+    if version is None:
+        print(c("       version not advertised — the verdict cannot rely on it; "
+                "patch regardless if PHP is in use.", "grey"))
 
-    # --- Check 2: POST-body fixation ----------------------------------------
-    sid_fix = "scanfix" + secrets.token_hex(10)
-    try:
-        st, _, setck = upload_progress_post(host, port, args.session_path,
-                                            sid_fix, "canary.txt",
-                                            send_cookie=False, timeout=args.timeout)
-    except OSError as e:
-        print(c(f"[2] Fixation          FAIL — connection error: {e}", "red"))
-        st, setck = "", ""
-    # If the server issues NO new Set-Cookie PHPSESSID, it accepted our body SID
-    # (use_only_cookies=Off). A fresh server-chosen cookie means it rejected it.
-    issued_new = bool(re.search(r"PHPSESSID=([^;]+)", setck)) and sid_fix not in setck
-    fixation_ok = st.startswith("HTTP") and not issued_new
-    results["fixation"] = fixation_ok
-    print(f"[2] Fixation          {'OK  ' if fixation_ok else 'no  '}"
-          f"POST-body PHPSESSID {'honored' if fixation_ok else 'not honored'} "
-          f"{c('(use_only_cookies=Off)', 'grey') if fixation_ok else ''}")
-    if setck:
-        print(c(f"       Set-Cookie: {setck}", "grey"))
+    # --- Check 2: SAPI ------------------------------------------------------
+    sapi, sapi_note = detect_sapi(headers, body)
+    results["sapi"] = sapi
+    print(f"[2] SAPI              {sapi}")
+    print(c(f"       {sapi_note}", "grey"))
+    print(c("       both CVEs apply to mod_php and PHP-FPM; the SAPI only "
+            "changes the internal path.", "grey"))
 
-    # --- Check 3: upload_progress accepted ----------------------------------
-    sid_up = "scanup" + secrets.token_hex(10)
-    try:
-        st3, _, _ = upload_progress_post(host, port, args.session_path,
-                                         sid_up, "probe.txt",
-                                         send_cookie=True, timeout=args.timeout)
-    except OSError as e:
-        st3 = f"ERR {e}"
-    up_ok = st3.startswith("HTTP") and " 200" in st3
-    results["upload_progress"] = up_ok
-    print(f"[3] upload_progress   {'OK  ' if up_ok else 'no  '}"
-          f"multipart probe -> {st3}")
-
-    # --- Check 4: inert canary confirmation (optional) ----------------------
-    confirmed = False
-    if args.lfi:
-        canary = "P2S_" + secrets.token_hex(12)          # inert, no PHP tags
-        sid_can = "scancan" + secrets.token_hex(10)
+    # --- Check 3: benign preconditions --------------------------------------
+    # Only attempt the raw-socket multipart probe over plain HTTP.
+    multipart_ok = None
+    session_seen = bool(re.search(r"PHPSESSID=", headers.get("set-cookie", "") or ""))
+    if u.scheme != "https":
+        sid = "scan" + secrets.token_hex(10)
         try:
-            upload_progress_post(host, port, args.session_path, sid_can,
-                                 canary, send_cookie=True, timeout=args.timeout)
+            st3, setck = multipart_probe(host, port, args.session_path, sid,
+                                         args.timeout)
+            multipart_ok = st3.startswith("HTTP")
+            if re.search(r"PHPSESSID=", setck or ""):
+                session_seen = True
+            print(f"[3] Preconditions     multipart POST -> {st3}")
+            if setck:
+                print(c(f"       Set-Cookie: {setck}", "grey"))
         except OSError as e:
-            print(c(f"[4] Confirm           FAIL — inject error: {e}", "red"))
-        candidates = ([args.save_path] if args.save_path else
-                      ["/tmp/sessions", "/var/lib/php/sessions",
-                       "/var/lib/php/session", "/var/lib/php5", "/tmp"])
-        hit_path = None
-        for base in candidates:
-            data = lfi_read(args.lfi, f"{base.rstrip('/')}/sess_{sid_can}", args.timeout)
-            if canary.encode() in data:
-                hit_path = base
-                break
-        confirmed = hit_path is not None
-        results["confirm"] = confirmed
-        if confirmed:
-            print(c(f"[4] Confirm           CONFIRMED — canary read back from "
-                    f"{hit_path}/sess_{sid_can}", "red"))
-            print(c("       inert token injected via upload_progress was returned "
-                    "through the LFI:", "grey"))
-            print(c(f"       canary={canary}  (swap for <?php ?> = RCE; see poc/)", "grey"))
-        else:
-            print(f"[4] Confirm           no  — canary not read back "
-                  f"(wrong --save-path, no LFI, or not injectable)")
+            print(c(f"[3] Preconditions     probe error: {e}", "red"))
     else:
-        print(c("[4] Confirm           skipped — pass --lfi to prove the primitive", "grey"))
+        print(c("[3] Preconditions     skipped (https; raw-socket probe is "
+                "plain-HTTP only)", "grey"))
+    results["session"] = session_seen
+    print(c(f"       PHP session handling observed: "
+            f"{'yes' if session_seen else 'not seen'}  "
+            f"(precondition for the stale-global-state path, CVE-2026-109619)",
+            "grey"))
 
     # --- Verdict ------------------------------------------------------------
     print()
-    if confirmed:
-        v = c("VULNERABLE (confirmed)", "red")
-        detail = "injection+inclusion primitive proven with an inert canary."
-    elif results.get("version") == "vulnerable" and results.get("fixation") \
-            and results.get("upload_progress"):
+    if results.get("version") == "vulnerable":
         v = c("LIKELY VULNERABLE", "red")
-        detail = ("affected version + fixation + upload_progress all present; "
-                  "supply --lfi to confirm end-to-end.")
+        detail = ("PHP version is below the October-2026 fixed release for its "
+                  "branch. These are unauthenticated-RCE memory-corruption bugs "
+                  "exploitable under default config — patch now.")
     elif results.get("version") == "patched":
         v = c("LIKELY PATCHED", "green")
         detail = "PHP version is at or above the fixed release for its branch."
-    elif results.get("upload_progress") or results.get("fixation"):
-        v = c("PRECONDITIONS PRESENT", "yellow")
-        detail = "some preconditions hold; version unclear or one check failed."
+    elif version is None and (results.get("session") or multipart_ok):
+        v = c("UNDETERMINED (PHP present, version hidden)", "yellow")
+        detail = ("PHP is in use but the version is not advertised; exposure "
+                  "cannot be judged remotely. Confirm the build and patch.")
     else:
-        v = c("NOT DETECTED", "green")
-        detail = "no preconditions observed over HTTP."
+        v = c("UNDETERMINED", "yellow")
+        detail = "could not establish the PHP version from this host."
     print(f"[=] Verdict: {v}")
     print(c(f"    {detail}", "grey"))
-    print(c("    Mitigate: session.upload_progress.enabled=Off; "
-            "use_only_cookies=On; patch PHP.", "grey"))
+    print(c("    Note: active confirmation requires forcing an out-of-memory "
+            "fatal (a DoS) and reclaiming corrupted heap; this tool does not "
+            "do that. Version is the reliable signal.", "grey"))
+    print(c("    Mitigate (temporary, NOT a substitute for patching):", "grey"))
+    print(c("      PHP-FPM:  session.upload_progress.enabled=0 ; memory_limit=-1", "grey"))
+    print(c("      mod_php:  memory_limit=-1", "grey"))
+    print(c("      memory_limit=-1 removes PHP's memory cap and raises "
+            "exhaustion risk — upgrade to a fixed release instead.", "grey"))
 
-    sys.exit(0 if confirmed or results.get("version") == "vulnerable" else 1)
+    sys.exit(0 if results.get("version") == "vulnerable" else 1)
 
 
 if __name__ == "__main__":
